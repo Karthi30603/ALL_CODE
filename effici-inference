@@ -1,0 +1,410 @@
+import os
+import argparse
+from typing import List, Tuple
+
+import cv2
+import numpy as np
+import pandas as pd
+import torch
+from PIL import Image
+from tqdm import tqdm
+
+# Import training utilities (model class + transforms)
+from efficientdet.fracture_efficientdet_training_args import (
+    EfficientDetModel,
+    get_valid_transforms,
+)
+
+###############################################################
+# Helper functions
+###############################################################
+
+
+def extract_single_prediction(outputs, idx: int, original_size: Tuple[int, int], model_img_dim: int):
+    """Extract prediction for a single image from batch outputs.
+
+    Parameters
+    ----------
+    outputs : dict
+        Raw model outputs as returned by EfficientDet bench.
+    idx : int
+        Index of the image inside the current batch.
+    original_size : (width, height)
+        Size of the image **before** any scaling (needed to map boxes back).
+    model_img_dim : int
+        Image dimension fed to model (square input assumed).
+
+    Returns
+    -------
+    dict
+        keys: boxes (np.ndarray[[N,4]]), scores (np.ndarray[N]), labels (np.ndarray[N])
+    """
+    try:
+        if isinstance(outputs, dict) and "detections" in outputs:
+            detections = outputs["detections"]
+            detection = (
+                detections[idx].detach().cpu().numpy()
+                if torch.is_tensor(detections[idx])
+                else detections[idx]
+            )
+
+            # Detection format: [x1, y1, x2, y2, conf, cls]
+            if detection.shape[0] > 0 and detection.shape[1] >= 6:
+                boxes = detection[:, :4].copy()
+                scores = detection[:, 4].copy()
+                labels = detection[:, 5].copy()
+
+                orig_w, orig_h = original_size
+                scale_x = orig_w / model_img_dim
+                scale_y = orig_h / model_img_dim
+
+                boxes[:, [0, 2]] *= scale_x  # x coordinates
+                boxes[:, [1, 3]] *= scale_y  # y coordinates
+
+                return {
+                    "boxes": boxes.astype(np.float32),
+                    "scores": scores.astype(np.float32),
+                    "labels": labels.astype(np.float32),
+                }
+    except Exception as e:
+        print(f"[WARN] Failed to extract predictions for idx={idx}: {e}")
+
+    # default empty output
+    return {
+        "boxes": np.zeros((0, 4), dtype=np.float32),
+        "scores": np.zeros(0, dtype=np.float32),
+        "labels": np.zeros(0, dtype=np.float32),
+    }
+
+
+@torch.no_grad()
+def predict_batch(
+    model: EfficientDetModel,
+    batch_imgs: torch.Tensor,
+    original_sizes: List[Tuple[int, int]],
+    conf_threshold: float,
+):
+    """Run inference for a batch of transformed tensors."""
+
+    device = next(model.parameters()).device
+
+    dummy_targets = {
+        "bbox": [torch.zeros((1, 4), dtype=torch.float32, device=device)] * batch_imgs.shape[0],
+        "cls": [torch.zeros(1, dtype=torch.long, device=device)] * batch_imgs.shape[0],
+        "img_size": torch.stack(
+            [
+                torch.tensor([model.image_dim, model.image_dim], dtype=torch.float32, device=device)
+                for _ in range(batch_imgs.shape[0])
+            ]
+        ),
+        "img_scale": torch.stack(
+            [torch.tensor(1.0, dtype=torch.float32, device=device)] * batch_imgs.shape[0]
+        ),
+    }
+
+    outputs = model(batch_imgs.to(device), dummy_targets)
+
+    batch_preds = []
+    for idx, orig_size in enumerate(original_sizes):
+        preds = extract_single_prediction(outputs, idx, orig_size, model.image_dim)
+
+        # filter by confidence
+        keep = preds["scores"] >= conf_threshold
+        batch_preds.append(
+            {
+                "boxes": preds["boxes"][keep],
+                "scores": preds["scores"][keep],
+                "labels": preds["labels"][keep],
+            }
+        )
+    return batch_preds
+
+
+###############################################################
+# Drawing utilities
+###############################################################
+
+
+def draw_boxes(
+    image_bgr: np.ndarray,
+    boxes: np.ndarray,
+    scores: np.ndarray,
+    conf_threshold: float = 0.3,
+):
+    for box, score in zip(boxes, scores):
+        if score < conf_threshold:
+            continue
+        x1, y1, x2, y2 = map(int, box)
+        cv2.rectangle(image_bgr, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.putText(
+            image_bgr,
+            f"{score:.2f}",
+            (x1, max(y1 - 5, 0)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 255, 0),
+            1,
+            cv2.LINE_AA,
+        )
+    return image_bgr
+
+
+###############################################################
+# Main CLI
+###############################################################
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="EfficientDet fracture detection inference script",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        required=True,
+        help="Path to .ckpt Lightning checkpoint from training",
+    )
+    parser.add_argument(
+        "--input_dir",
+        type=str,
+        default=None,
+        help="Directory containing images for inference (recursively searched).",
+    )
+    parser.add_argument(
+        "--input_csv",
+        type=str,
+        default=None,
+        help="Optional csv with a column 'study_path' listing image paths relative to data_dir",
+    )
+    parser.add_argument(
+        "--data_dir",
+        type=str,
+        default=None,
+        help="Root directory that contains the images referred in csv (used only with --input_csv).",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="inference_output",
+        help="Directory to write visualisations and predictions.csv",
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=4,
+        help="Batch size for inference",
+    )
+    parser.add_argument(
+        "--conf_threshold",
+        type=float,
+        default=0.3,
+        help="Confidence threshold for showing predictions",
+    )
+    return parser.parse_args()
+
+
+###############################################################
+# Entry
+###############################################################
+
+
+def gather_image_paths(args) -> List[str]:
+    """Collect absolute image paths based on CLI arguments."""
+
+    exts = (".jpg", ".jpeg", ".png")
+
+    if args.input_csv:
+        if not args.data_dir:
+            raise ValueError("--data_dir must be specified when using --input_csv")
+        df = pd.read_csv(args.input_csv)
+        if "study_path" not in df.columns:
+            raise ValueError("CSV must contain a 'study_path' column")
+        paths = []
+        for p in df["study_path"].tolist():
+            # absolute path remains as-is; else join with data_dir
+            if os.path.isabs(p):
+                paths.append(p)
+            else:
+                paths.append(os.path.join(args.data_dir, p.lstrip("/")))
+        return paths
+
+    if args.input_dir:
+        collected = []
+        for root, _, files in os.walk(args.input_dir):
+            for f in files:
+                if f.lower().endswith(exts):
+                    collected.append(os.path.join(root, f))
+        return collected
+
+    raise ValueError("Either --input_dir or --input_csv must be provided")
+
+
+def main():
+    args = parse_args()
+
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    print("Loading model…")
+    model: EfficientDetModel = EfficientDetModel.load_from_checkpoint(args.checkpoint)
+    model.eval()
+    model.to(device)
+
+    # Albumentations validation transforms (same normalization as training)
+    transforms = get_valid_transforms(model.image_dim)
+
+    image_paths = gather_image_paths(args)
+    print(f"Found {len(image_paths)} images for inference")
+
+    # Records for detection-level CSV
+    csv_records = []
+    # Records for per-image classification
+    class_records = []
+
+    batch_imgs = []
+    batch_orig_sizes = []
+    batch_file_paths = []
+
+    def flush_batch():
+        nonlocal batch_imgs, batch_orig_sizes, batch_file_paths
+        if not batch_imgs:
+            return
+        batch_tensor = torch.stack(batch_imgs)
+        preds = predict_batch(
+            model, batch_tensor, batch_orig_sizes, conf_threshold=args.conf_threshold
+        )
+        for img_path, pred in zip(batch_file_paths, preds):
+            # derive ground-truth label from parent folder name
+            gt_label = os.path.basename(os.path.dirname(img_path)).lower()
+            if gt_label not in ["fracture", "normal"]:
+                # fallback to unknown
+                gt_label = "unknown"
+
+            # Determine predicted label: fracture if any box above threshold else normal
+            pred_label = "fracture" if pred["boxes"].shape[0] > 0 else "normal"
+
+            # draw + save
+            img_bgr = cv2.imread(img_path)
+            if img_bgr is None:
+                continue
+            draw_boxes(img_bgr, pred["boxes"], pred["scores"], args.conf_threshold)
+            out_path = os.path.join(args.output_dir, os.path.basename(img_path))
+            cv2.imwrite(out_path, img_bgr)
+
+            # csv rows
+            for box, score in zip(pred["boxes"], pred["scores"]):
+                x1, y1, x2, y2 = box.tolist()
+                csv_records.append(
+                    {
+                        "image": os.path.basename(img_path),
+                        "x1": x1,
+                        "y1": y1,
+                        "x2": x2,
+                        "y2": y2,
+                        "confidence": float(score),
+                    }
+                )
+
+            # classification record
+            class_records.append({
+                "image": os.path.basename(img_path),
+                "gt_label": gt_label,
+                "pred_label": pred_label,
+            })
+
+        # reset
+        batch_imgs, batch_orig_sizes, batch_file_paths = [], [], []
+
+    for img_path in tqdm(image_paths):
+        try:
+            img = Image.open(img_path).convert("RGB")
+        except Exception as e:
+            print(f"[WARN] Could not open {img_path}: {e}")
+            continue
+
+        orig_size = img.size  # (width, height)
+        img_np = np.array(img)
+        transformed = transforms(image=img_np, bboxes=[], labels=[])
+        img_tensor = transformed["image"]
+
+        batch_imgs.append(img_tensor)
+        batch_orig_sizes.append(orig_size)
+        batch_file_paths.append(img_path)
+
+        if len(batch_imgs) == args.batch_size:
+            flush_batch()
+
+    # flush remaining
+    flush_batch()
+
+    # save detection csv
+    predictions_csv = os.path.join(args.output_dir, "predictions.csv")
+    if csv_records:
+        pd.DataFrame(csv_records).to_csv(predictions_csv, index=False)
+        print(f"Saved predictions to {predictions_csv}")
+    else:
+        print("No predictions above confidence threshold were made.")
+
+    # Save classification csv
+    class_csv = os.path.join(args.output_dir, "classification.csv")
+    if class_records:
+        pd.DataFrame(class_records).to_csv(class_csv, index=False)
+
+    # Compute metrics
+    tp = fp = tn = fn = 0
+    for rec in class_records:
+        gt = rec["gt_label"]
+        pred = rec["pred_label"]
+        if gt == "fracture":
+            if pred == "fracture":
+                tp += 1
+            else:
+                fn += 1
+        elif gt == "normal":
+            if pred == "normal":
+                tn += 1
+            else:
+                fp += 1
+
+    total = tp + tn + fp + fn
+    accuracy = (tp + tn) / total if total else 0
+    precision = tp / (tp + fp) if (tp + fp) else 0
+    recall = tp / (tp + fn) if (tp + fn) else 0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0
+    specificity = tn / (tn + fp) if (tn + fp) else 0
+
+    metrics = {
+        "total_images": total,
+        "tp": tp,
+        "fp": fp,
+        "tn": tn,
+        "fn": fn,
+        "accuracy": accuracy,
+        "precision": precision,
+        "recall": recall,
+        "f1_score": f1,
+        "specificity": specificity,
+        "confidence_threshold": args.conf_threshold,
+    }
+
+    import json
+    metrics_path = os.path.join(args.output_dir, "metrics.json")
+    with open(metrics_path, "w") as f:
+        json.dump(metrics, f, indent=2)
+
+    print("\nClassification metrics saved to", metrics_path)
+    for k, v in metrics.items():
+        if k in ["tp", "fp", "tn", "fn", "total_images"]:
+            print(f"{k.upper():>12}: {v}")
+        else:
+            print(f"{k.capitalize():>12}: {v:.4f}")
+    print()
+
+    print("Inference completed!")
+
+
+if __name__ == "__main__":
+    main() 

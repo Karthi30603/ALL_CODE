@@ -1,0 +1,45 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment files
+.env
+pwd.env
+*.env
+
+# Model weights
+*.pt
+*.pth
+*.h5
+*.hdf5
+*.ckpt
+*.bin
+*.safetensors
+
+# Logs
+*.log
+
+# Data files
+*.csv
+*.tsv
+*.nii.gz
+*.nii
+*.dcm
+*.dicom
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak
+
